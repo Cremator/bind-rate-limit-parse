@@ -6,46 +6,74 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
 	"regexp"
-	"strings"
 	"time"
 
-	"github.com/redis/rueidis"
+	"github.com/dgraph-io/badger/v4"
 	"go4.org/netipx"
 )
 
 var (
-	redisAddr     string
-	cidrKeyPrefix string
 	cidrWebPrefix string
 	expiration    time.Duration
-	redisDelay    time.Duration
 	randomness    float64
-	redisDB       int
+	dbPath        string
 	httpPort      string
+	db            *badger.DB
+	ctx, cancel   = context.WithCancel(context.Background())
+	invalidSet    *netipx.IPSet
+	cidrRegex     = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}\b`)
+	cidrCh        = make(chan map[string]string, 10000)
 )
 
 func init() {
-	flag.StringVar(&redisAddr, "redis", "localhost:6379", "Redis server address")
-	flag.StringVar(&cidrKeyPrefix, "redisprefix", "cidrs:", "Prefix for keys to store CIDRs")
+	// Command line flags configuration for application settings
+
+	// URL path prefix for HTTP endpoint serving CIDR data
 	flag.StringVar(&cidrWebPrefix, "webprefix", "/cidrs", "Prefix for HTTP CIDRs endpoint")
+
+	// Time after which individual CIDR entries expire (in seconds)
 	flag.DurationVar(&expiration, "expiration", time.Hour*24, "Expiration time for individual CIDRs (in seconds)")
+
+	// Multiplier applied to expiration duration to introduce random variation
 	flag.Float64Var(&randomness, "randomness", 1.5, "Expiration time randomness")
-	flag.IntVar(&redisDB, "redisdb", 2, "Select Redis DB")
+
+	// Redis database number selection
+	flag.StringVar(&dbPath, "dbpath", "/badger-data", "Select Badger DB path")
+
+	// Port for the HTTP server to listen on
 	flag.StringVar(&httpPort, "port", "8080", "HTTP server port")
-	flag.DurationVar(&redisDelay, "redis-delay", time.Millisecond*500, "Delay Redis TS.ADDs duration")
+
+	// Parse command line flags to populate the variables
 	flag.Parse()
+	b := netipx.IPSetBuilder{}
+
+	b.AddPrefix(netip.MustParsePrefix("0.0.0.0/8"))
+	b.AddPrefix(netip.MustParsePrefix("10.0.0.0/8"))
+	b.AddPrefix(netip.MustParsePrefix("100.64.0.0/10"))
+	b.AddPrefix(netip.MustParsePrefix("127.0.0.0/8"))
+	b.AddPrefix(netip.MustParsePrefix("169.254.0.0/16"))
+	b.AddPrefix(netip.MustParsePrefix("172.16.0.0/12"))
+	b.AddPrefix(netip.MustParsePrefix("192.0.0.0/24"))
+	b.AddPrefix(netip.MustParsePrefix("192.0.2.0/24"))
+	b.AddPrefix(netip.MustParsePrefix("192.88.99.0/24"))
+	b.AddPrefix(netip.MustParsePrefix("192.168.0.0/16"))
+	b.AddPrefix(netip.MustParsePrefix("198.18.0.0/15"))
+	b.AddPrefix(netip.MustParsePrefix("198.51.100.0/24"))
+	b.AddPrefix(netip.MustParsePrefix("203.0.113.0/24"))
+	b.AddPrefix(netip.MustParsePrefix("240.0.0.0/4"))
+	b.AddPrefix(netip.MustParsePrefix("255.255.255.255/32"))
+
+	invalidSet, _ = b.IPSet()
 }
 
 func main() {
-	// Create a parent context
-	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Handle OS signals to trigger cancellation
@@ -59,27 +87,31 @@ func main() {
 	}()
 
 	// Initialize Redis client
-	rdb, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress:      []string{redisAddr},
-		MaxFlushDelay:    redisDelay,
-		DisableCache:     true,
-		AlwaysPipelining: true,
-		SelectDB:         redisDB,
-	})
+	opts := badger.DefaultOptions(dbPath)
+	opts.Logger = nil // silence logs if needed
+
+	var err error
+	db, err = badger.Open(opts)
 	if err != nil {
-		log.Fatalf("Error while creating new connection error = %v", err)
+		log.Fatalf("Error opening BadgerDB: %v", err)
 	}
-
-	resp := rdb.Do(ctx, rdb.B().Ping().Build())
-
-	if err := resp.Error(); err != nil {
-		log.Fatalf("Error while pinging redis server = %v", err)
-	} else {
-		log.Printf("Received PONG from Redis at address: %s, DB: %d...", redisAddr, redisDB)
-	}
-
+	defer db.Close()
+	// Start a goroutine to process CIDR entries from the channel and insert them into Badger
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case c := <-cidrCh:
+				if len(c) == 0 {
+					continue
+				}
+				insertCIDRsToBadger(c)
+			}
+		}
+	}()
 	// Start syslog server
-	go startSyslogServer(ctx, rdb)
+	go startSyslogServer()
 
 	// Start HTTP server
 	http.HandleFunc(cidrWebPrefix, func(w http.ResponseWriter, r *http.Request) {
@@ -88,8 +120,8 @@ func main() {
 			http.Error(w, "Server shutting down", http.StatusServiceUnavailable)
 			return
 		default:
-			// Retrieve all CIDRs from Redis
-			cidrs, err := getAllCIDRs(ctx, rdb)
+			// Retrieve all CIDRs from Badger
+			cidrs, err := getAllCIDRs()
 			if err != nil {
 				http.Error(w, "Failed to retrieve CIDRs", http.StatusInternalServerError)
 				return
@@ -123,7 +155,7 @@ func main() {
 	}
 }
 
-func startSyslogServer(ctx context.Context, rdb rueidis.Client) {
+func startSyslogServer() {
 	// Set up UDP listener on port 514
 	udpAddr, err := net.ResolveUDPAddr("udp", ":514")
 	if err != nil {
@@ -151,7 +183,7 @@ func startSyslogServer(ctx context.Context, rdb rueidis.Client) {
 	log.Println("Rsyslog server is listening on port 514...")
 
 	// Start a goroutine to handle UDP syslog messages
-	go handleSyslogMessages(ctx, udpConn, rdb)
+	go handleUDP(udpConn)
 
 	// Start a goroutine to handle TCP syslog messages
 	go func() {
@@ -160,52 +192,98 @@ func startSyslogServer(ctx context.Context, rdb rueidis.Client) {
 			case <-ctx.Done():
 				return
 			default:
-				tcpConn, err := tcpListener.Accept()
-				if err != nil {
-					log.Printf("Failed to accept TCP connection: %v", err)
-					continue
-				}
-				go handleSyslogMessages(ctx, tcpConn, rdb)
 			}
+
+			tcpConn, err := tcpListener.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("accept error: %v", err)
+				continue
+			}
+			go handleTCP(tcpConn)
 		}
 	}()
 
 	// Wait for interrupt signal to gracefully shutdown
 	<-ctx.Done()
 
-	log.Println("Shutting down syslog server...")
+	log.Println("Closing syslog listeners...")
+
+	_ = tcpListener.Close()
+	_ = udpConn.Close()
+
+	time.Sleep(200 * time.Millisecond) // allow goroutines to exit cleanly
+
+	log.Println("Syslog server stopped")
 }
 
-func handleSyslogMessages(ctx context.Context, conn net.Conn, rdb rueidis.Client) {
+func handleUDP(conn *net.UDPConn) {
+	buf := make([]byte, 65535)
+
+	for {
+
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+
+		select {
+		case cidrCh <- extractCIDRsFromMessage(string(buf[:n])):
+		default:
+			log.Println("cidrCh full, dropping syslog message")
+		}
+	}
+}
+
+func handleTCP(conn net.Conn) {
 	defer conn.Close()
-	reader := bufio.NewScanner(conn)
-	reader.Split(bufio.ScanLines)
-	for reader.Scan() {
+
+	r := bufio.NewReader(conn)
+
+	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second)) // Set read deadline to avoid blocking indefinitely
-			line := reader.Bytes()
-			// Print the received syslog message
-			log.Printf("Received syslog message: %s\n", line[:])
-			insertCIDRsToRedis(ctx, rdb, extractCIDRsFromMessage(string(line[:])))
+		}
+
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			return
+		}
+
+		select {
+		case cidrCh <- extractCIDRsFromMessage(line):
+		default:
+			log.Println("cidrCh full, dropping syslog message")
 		}
 	}
 }
 
 func extractCIDRsFromMessage(m string) map[string]string {
 	// Extract CIDRs from the message
-	cidrRegex := regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}\b`)
+
 	matchesr := cidrRegex.FindAllString(m, -1)
 	var matches = make(map[string]string)
 	for _, ms := range matchesr {
 		if c, err := netip.ParsePrefix(ms); err != nil {
 			log.Println("Error parsing CIDR:", err)
-			return matches
+			continue
 		} else if c.Bits() < 24 || ms != c.String() || invalidCIDR(c) {
 			log.Printf("Error CIDR conversion - origin - %s - convert - %s\n", ms, c.String())
-			return matches
+			continue
 		} else {
 			matches[c.String()] = m
 		}
@@ -213,76 +291,79 @@ func extractCIDRsFromMessage(m string) map[string]string {
 	return matches
 }
 
-func insertCIDRsToRedis(ctx context.Context, rdb rueidis.Client, c map[string]string) {
+func insertCIDRsToBadger(c map[string]string) {
 	if len(c) == 0 {
 		return
 	}
 
-	// Store CIDRs in Redis with expiration
-	for cidr, msg := range c {
-		key := cidrKeyPrefix + cidr
-		//log.Printf("Trying to insert %s key into Redis\n", key)
-		r := rand.Intn(int(expiration.Seconds()*randomness)) + int(expiration.Seconds())
-		resp := rdb.Do(ctx, rdb.B().Set().Key(key).Value(msg).Build())
-		if err := resp.Error(); err != nil {
-			log.Println("Error inserting CIDR into Redis:", err)
-			return
+	base := int64(expiration.Seconds())
+	jitter := int64(float64(base) * randomness)
+
+	if jitter <= 0 {
+		jitter = 1
+	}
+
+	err := db.Update(func(txn *badger.Txn) error {
+		for cidr, msg := range c {
+			ttl := time.Duration(base+rand.Int64N(jitter)) * time.Second
+			if err := txn.SetEntry(
+				badger.NewEntry([]byte(cidr), []byte(msg)).WithTTL(ttl),
+			); err != nil {
+				return err
+			}
 		}
-		resp = rdb.Do(ctx, rdb.B().Expire().Key(key).Seconds(int64(r)).Build())
-		if err := resp.Error(); err != nil {
-			log.Println("Error expiring CIDR into Redis:", err)
-			return
-		}
+		return nil
+	})
+
+	if err != nil {
+		log.Println("Badger insert error:", err)
 	}
 }
 
-func getAllCIDRs(ctx context.Context, rdb rueidis.Client) ([]string, error) {
-	// Get all keys matching the prefix
-	keys, err := rdb.Do(ctx, rdb.B().Keys().Pattern(cidrKeyPrefix+"*").Build()).AsStrSlice()
+func getAllCIDRs() ([]string, error) {
+	var cidrs []string
+	var sorted netipx.IPSetBuilder
+
+	err := db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			cidrStr := string(key)
+
+			c, err := netip.ParsePrefix(cidrStr)
+			if err != nil {
+				continue
+			}
+
+			if c.Bits() < 24 {
+				continue
+			}
+
+			sorted.AddPrefix(c)
+		}
+
+		return nil
+	})
+
 	if err != nil {
 		return nil, err
 	}
-	// Extract CIDRs from keys
-	var cidrs []string
-	var sorted netipx.IPSetBuilder
-	for _, key := range keys {
-		// Remove the prefix from the key
-		add := strings.TrimPrefix(key, cidrKeyPrefix)
-		if c, err := netip.ParsePrefix(add); err != nil {
-			log.Println("Error parsing CIDR:", err)
-			continue
-		} else if ones := c.Bits(); ones < 24 {
-			log.Printf("Wrong bits CIDR: %#v, from address: %#v, from key: %#v\n", c.String(), add, key)
-			continue
-		} else {
-			sorted.AddPrefix(c)
-		}
-	}
+
 	merged, _ := sorted.IPSet()
 	for _, c := range merged.Prefixes() {
 		cidrs = append(cidrs, c.String())
 	}
+
 	return cidrs, nil
 }
 
 func invalidCIDR(c netip.Prefix) bool {
-	var invalidCIDR netipx.IPSetBuilder
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("0.0.0.0/8"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("10.0.0.0/8"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("100.64.0.0/10"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("127.0.0.0/8"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("169.254.0.0/16"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("172.16.0.0/12"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("192.0.0.0/24"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("192.0.2.0/24"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("192.88.99.0/24"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("192.168.0.0/16"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("198.18.0.0/15"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("198.51.100.0/24"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("203.0.113.0/24"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("240.0.0.0/4"))
-	invalidCIDR.AddPrefix(netip.MustParsePrefix("255.255.255.255/32"))
-
-	r, _ := invalidCIDR.IPSet()
-	return r.ContainsPrefix(c)
+	return invalidSet.ContainsPrefix(c)
 }
