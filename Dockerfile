@@ -1,4 +1,4 @@
-FROM golang:1.22.1-alpine AS build-env
+FROM golang:1.26-alpine AS build-env
 
 WORKDIR /build
 
@@ -13,10 +13,11 @@ COPY main.go go.mod go.sum /build/
 RUN go version
 RUN go build
 
-FROM alpine:3.19.1
+FROM alpine:3.22
 
 COPY --from=build-env /build/bind-rate-limit-parse-redis /bind-rate-limit-parse-redis
-
+RUN mkdir -p /badger-data && chown 1000:1000 /badger-data
+VOLUME /badger-data
 HEALTHCHECK --interval=5s --timeout=3s \
     CMD ps aux | grep 'bind-rate-limit-parse-redis' || exit 1
 
