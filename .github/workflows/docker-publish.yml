@@ -27,11 +27,11 @@ jobs:
       - name: Build Docker image
         run: |
           REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE=ghcr.io/$REPO/bind-rate-limit-parse-redis:latest
+          IMAGE=ghcr.io/$REPO:latest
           docker build -t $IMAGE .
 
       - name: Push Docker image
         run: |
           REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE=ghcr.io/$REPO/bind-rate-limit-parse-redis:latest
+          IMAGE=ghcr.io/$REPO:latest
           docker push $IMAGE
