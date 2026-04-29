@@ -86,9 +86,10 @@ func main() {
 		cancel()
 	}()
 
-	// Initialize Redis client
+	// Initialize BadgerDB with specified options for performance and log management
 	opts := badger.DefaultOptions(dbPath)
-	opts.Logger = nil // silence logs if needed
+	opts.Logger = nil                 // silence logs if needed
+	opts.ValueLogFileSize = 128 << 20 // 128MB value log file size for faster writes
 
 	var err error
 	db, err = badger.Open(opts)
@@ -96,6 +97,17 @@ func main() {
 		log.Fatalf("Error opening BadgerDB: %v", err)
 	}
 	defer db.Close()
+	// Start a goroutine to periodically run Badger's value log garbage collection to manage disk space
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			for {
+				if err := db.RunValueLogGC(0.5); err != nil {
+					break
+				}
+			}
+		}
+	}()
 	// Start a goroutine to process CIDR entries from the channel and insert them into Badger
 	go func() {
 		for {
