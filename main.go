@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
-	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -329,12 +328,10 @@ func getAllCIDRs() ([]string, error) {
 	err := db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
-		count := atomic.Int64{}
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
-			count.Add(1)
 			item := it.Item()
 			key := item.Key()
 
@@ -351,7 +348,6 @@ func getAllCIDRs() ([]string, error) {
 
 			sorted.AddPrefix(c)
 		}
-		log.Printf("Total CIDRs found: %d", count.Load())
 		return nil
 	})
 
