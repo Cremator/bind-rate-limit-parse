@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -293,7 +294,7 @@ func extractCIDRsFromMessage(m string) map[string]string {
 		if c, err := netip.ParsePrefix(ms); err != nil {
 			log.Println("Error parsing CIDR:", err)
 			continue
-		} else if c.Bits() < 24 || ms != c.String() || invalidCIDR(c) {
+		} else if c.Bits() < 24 || ms != c.String() || invalidSet.ContainsPrefix(c) {
 			log.Printf("Error CIDR conversion - origin - %s - convert - %s\n", ms, c.String())
 			continue
 		} else {
@@ -340,11 +341,12 @@ func getAllCIDRs() ([]string, error) {
 	err := db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
-
+		count := atomic.Int64{}
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
+			count.Add(1)
 			item := it.Item()
 			key := item.Key()
 
@@ -361,7 +363,7 @@ func getAllCIDRs() ([]string, error) {
 
 			sorted.AddPrefix(c)
 		}
-
+		log.Printf("Total CIDRs found: %d", count.Load())
 		return nil
 	})
 
@@ -375,8 +377,4 @@ func getAllCIDRs() ([]string, error) {
 	}
 
 	return cidrs, nil
-}
-
-func invalidCIDR(c netip.Prefix) bool {
-	return invalidSet.ContainsPrefix(c)
 }
