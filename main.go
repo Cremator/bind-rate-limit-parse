@@ -288,6 +288,7 @@ func extractCIDRsFromMessage(m string) map[string]string {
 			matches[c.String()] = m
 		}
 	}
+	log.Printf("Received syslog message: %s\n", m)
 	return matches
 }
 
