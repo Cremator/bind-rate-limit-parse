@@ -23,7 +23,6 @@ import (
 var (
 	cidrWebPrefix string
 	expiration    time.Duration
-	randomness    float64
 	dbPath        string
 	httpPort      string
 	db            *badger.DB
@@ -40,10 +39,7 @@ func init() {
 	flag.StringVar(&cidrWebPrefix, "webprefix", "/cidrs", "Prefix for HTTP CIDRs endpoint")
 
 	// Time after which individual CIDR entries expire (in seconds)
-	flag.DurationVar(&expiration, "expiration", time.Hour*24, "Expiration time for individual CIDRs (in seconds)")
-
-	// Multiplier applied to expiration duration to introduce random variation
-	flag.Float64Var(&randomness, "randomness", 1.5, "Expiration time randomness")
+	flag.DurationVar(&expiration, "expiration", time.Hour*2, "Expiration time for individual CIDRs")
 
 	// Redis database number selection
 	flag.StringVar(&dbPath, "dbpath", "/badger-data", "Select Badger DB path")
@@ -310,18 +306,10 @@ func insertCIDRsToBadger(c map[string]string) {
 		return
 	}
 
-	base := int64(expiration.Seconds())
-	jitter := int64(float64(base) * randomness)
-
-	if jitter <= 0 {
-		jitter = 1
-	}
-
 	err := db.Update(func(txn *badger.Txn) error {
 		for cidr, msg := range c {
-			ttl := time.Duration(base+rand.Int64N(jitter)) * time.Second
 			if err := txn.SetEntry(
-				badger.NewEntry([]byte(cidr), []byte(msg)).WithTTL(ttl),
+				badger.NewEntry([]byte(cidr), []byte(msg)).WithTTL(expiration + time.Duration(rand.Int64N(int64(expiration/2)))*time.Second),
 			); err != nil {
 				return err
 			}
