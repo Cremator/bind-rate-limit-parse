@@ -132,7 +132,7 @@ func main() {
 			for _, cidr := range cidrs {
 				fmt.Fprintf(w, "%s\n", cidr)
 			}
-			log.Printf("HTTP Web request for URL: %s, from: %s, header: %s\n", r.URL, r.RemoteAddr, r.Header)
+			log.Printf("HTTP Web request for URL: %s, from: %s, header: %s, cidrs: %d\n", r.URL, r.RemoteAddr, r.Header, len(cidrs))
 		}
 	})
 
