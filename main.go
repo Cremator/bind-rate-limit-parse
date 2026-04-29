@@ -88,8 +88,8 @@ func main() {
 
 	// Initialize BadgerDB with specified options for performance and log management
 	opts := badger.DefaultOptions(dbPath)
-	opts.Logger = nil                 // silence logs if needed
-	opts.ValueLogFileSize = 128 << 20 // 128MB value log file size for faster writes
+	opts.Logger = nil                   // silence logs if needed
+	opts.ValueLogFileSize = 128<<20 - 1 // 128MB value log file size for faster writes
 
 	var err error
 	db, err = badger.Open(opts)
