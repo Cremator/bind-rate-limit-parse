@@ -15,10 +15,10 @@ RUN go build
 
 FROM alpine:3.22
 
-COPY --from=build-env /build/bind-rate-limit-parse-redis /bind-rate-limit-parse-redis
+COPY --from=build-env /build/bind-rate-limit-parse /bind-rate-limit-parse
 RUN mkdir -p /badger-data && chown 1000:1000 /badger-data
 VOLUME /badger-data
 HEALTHCHECK --interval=5s --timeout=3s \
-    CMD ps aux | grep 'bind-rate-limit-parse-redis' || exit 1
+    CMD ps aux | grep 'bind-rate-limit-parse' || exit 1
 
-ENTRYPOINT ["/bind-rate-limit-parse-redis"]
+ENTRYPOINT ["/bind-rate-limit-parse"]
